@@ -142,7 +142,7 @@ machine already has and edits two lines of it.
 
 The machine's full story, including the config this was built against and the day
 a Debian package deleted its dynamic loader:
-https://github.com/itsdanylol/jetson-field-notes
+https://github.com/itsdanylol/jetson-orin-arch-omarchy
 
 ## License
 
