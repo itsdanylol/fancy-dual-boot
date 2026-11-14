@@ -36,7 +36,7 @@ which is honest rather than clever: pass `--cfg` and it edits the other.
 ## C. Chainloading the vendor launcher
 
 Some vendors ship their own bootloader that owns the machine's supported boot
-path. Windows has `bootmgfw.efi`; NVIDIA's Jetson has `L4tLauncher.efi`, which
+path. Windows has `bootmgfw.efi`; NVIDIA's Jetson boards have `L4tLauncher.efi`, which
 reads `extlinux.conf` from the boot partition and owns the kernel command line.
 
 In this layout GRUB is a menu that hands control over:
@@ -57,7 +57,7 @@ not a partition, it is a filesystem image inside a partition:
 
 ```text
 /dev/nvme0n1p1            ext4   930G   the outer filesystem
-  /opt/omarchy/omarchy.img  ext4   512G   the actual root, loop-mounted
+  /opt/images/root.img      ext4   512G   the actual root, loop-mounted
 ```
 
 GRUB has to read the kernel and initramfs out of the outer filesystem and hand
@@ -67,8 +67,8 @@ root on its own, and a `root=` would race it and possibly fsck the outer
 filesystem while it is in use.
 
 Cost: one line of GRUB config is doing the work of a whole initramfs hook, and an
-error there is a kernel panic with a UUID in it. The Jetson case study has the
-real config: [jetson-case-study.md](jetson-case-study.md).
+error there is a kernel panic with a UUID in it. Keep an entry that boots
+without the image, and test the new line with `grub-reboot` before you trust it.
 
 ## Picking a layout on purpose
 

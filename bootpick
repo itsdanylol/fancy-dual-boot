@@ -7,7 +7,7 @@
 #   bootpick list             show the entries GRUB will number
 #   bootpick show             what is default right now
 #   bootpick set 1            make entry 1 the default
-#   bootpick set omarchy      same thing, by name
+#   bootpick set windows      same thing, by name
 #   bootpick timeout 8        change the menu countdown
 #   bootpick backups          list what has been saved
 #   bootpick restore          put the newest backup back

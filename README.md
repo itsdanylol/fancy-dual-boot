@@ -12,10 +12,10 @@ $ sudo bootpick list
 
   ID     ENTRY                                      KIND
   --     -----                                      ----
-    0     Ubuntu                                     entry
-  ● 1     Omarchy                                    entry
+    0     Linux                                      entry
+  ● 1     Windows                                    entry
     2     Advanced options                           submenu
-    2>0   Omarchy (rescue shell)                     subentry
+    2>0   Linux (rescue shell)                       subentry
 
   ● = boots by default    timeout: 5s
 ```
@@ -66,7 +66,7 @@ bootpick                     interactive picker
 bootpick list                every entry, in GRUB's numbering
 bootpick show                which entry is default, and the timeout
 bootpick set 1               make entry 1 the default
-bootpick set omarchy         same thing, by name (case-insensitive, substring ok)
+bootpick set windows         same thing, by name (case-insensitive, substring ok)
 bootpick set '2>0'           an entry inside a submenu
 bootpick timeout 8           menu countdown
 bootpick backups             what has been saved
@@ -130,15 +130,19 @@ theme/icons/ubuntu.png
 96x96 PNGs, named after the `--class` on each `menuentry`. GRUB falls back to
 no icon for a class it cannot resolve, so a missing file is cosmetic.
 
-## The machine it was written on
+## Where it came from
 
-A Jetson Orin Nano Super running Ubuntu in the firmware's own launcher and
-Arch/Omarchy from a loop-mounted image file, with a hand-written GRUB config on
-the ESP, a rescue submenu, and a theme. The full config and the reasoning behind
-every line: [docs/jetson-case-study.md](docs/jetson-case-study.md).
+Written for one machine with two systems on it, one of which boots out of a
+loop-mounted image file, and a hand-written config on the ESP that nobody wanted
+to edit by hand at 2am again.
 
-The rest of that machine, including the day a Debian package deleted its dynamic
-loader: https://github.com/itsdanylol/handbuilt-jetson
+The tool ships no menu of its own. No default file, no entries, no theme forced
+on you, no paths from someone else's disk: it reads whatever `grub.cfg` your
+machine already has and edits two lines of it.
+
+The machine's full story, including the config this was built against and the day
+a Debian package deleted its dynamic loader:
+https://github.com/itsdanylol/jetson-field-notes
 
 ## License
 

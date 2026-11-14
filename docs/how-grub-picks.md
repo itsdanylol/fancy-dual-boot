@@ -47,7 +47,7 @@ children are addressed as `<parent>><child>`.
 
 ```text
 menuentry "Ubuntu"                    → 0
-menuentry "Omarchy"                   → 1
+menuentry "Windows"                   → 1
 submenu "Advanced options"            → 2
     menuentry "rescue shell"          → 2>0
     menuentry "older kernel"          → 2>1
@@ -57,7 +57,7 @@ So:
 
 ```
 set default=0     Ubuntu
-set default=1     Omarchy
+set default=1     Windows
 set default=2     opens the submenu, does not boot anything
 set default=2>0   rescue shell directly
 ```
@@ -85,7 +85,7 @@ line.
 `grub-reboot` sets an entry for exactly one boot and then reverts:
 
 ```sh
-sudo grub-reboot 'Omarchy'
+sudo grub-reboot 'Windows'
 sudo reboot
 ```
 
