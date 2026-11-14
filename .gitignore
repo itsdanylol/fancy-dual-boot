@@ -1,0 +1,7 @@
+# ESP backups and scratch
+grub.cfg.bak-*
+.bootpick.*
+
+# local
+*.swp
+.DS_Store

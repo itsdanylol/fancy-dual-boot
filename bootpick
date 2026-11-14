@@ -1,0 +1,483 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# bootpick — choose which OS GRUB boots by default, and keep a way back.
+#
+#   bootpick                  interactive picker
+#   bootpick list             show the entries GRUB will number
+#   bootpick show             what is default right now
+#   bootpick set 1            make entry 1 the default
+#   bootpick set omarchy      same thing, by name
+#   bootpick timeout 8        change the menu countdown
+#   bootpick backups          list what has been saved
+#   bootpick restore          put the newest backup back
+#   bootpick --dry-run set 1  say what would change, change nothing
+#
+# It edits one line of the grub.cfg that actually lives on the ESP, keeps a
+# timestamped backup beside it, and refuses to leave the file in a state the
+# GRUB parser cannot read.
+
+set -uo pipefail
+
+VERSION="1.0.0"
+PROG=${0##*/}
+
+CFG_OVERRIDE=""
+DRY_RUN=0
+ASSUME_YES=0
+KEEP_BACKUPS=5
+
+MNT=""          # mountpoint we created, if any
+DEV=""          # device we mounted
+CFG=""          # resolved config path
+
+# ---------------------------------------------------------------- output
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+	C_DIM=$'\033[2m'; C_OFF=$'\033[0m'; C_HI=$'\033[1m'; C_ACC=$'\033[38;5;75m'
+	C_WARN=$'\033[38;5;214m'; C_ERR=$'\033[38;5;203m'; C_OK=$'\033[38;5;114m'
+else
+	C_DIM=""; C_OFF=""; C_HI=""; C_ACC=""; C_WARN=""; C_ERR=""; C_OK=""
+fi
+
+say()  { printf '%s\n' "$*"; }
+dim()  { printf '%s%s%s\n' "$C_DIM" "$*" "$C_OFF"; }
+note() { printf '%s»%s %s\n' "$C_ACC" "$C_OFF" "$*"; }
+warn() { printf '%s!%s %s\n' "$C_WARN" "$C_OFF" "$*" >&2; }
+ok()   { printf '%s✓%s %s\n' "$C_OK" "$C_OFF" "$*"; }
+die()  { printf '%s✗%s %s\n' "$C_ERR" "$C_OFF" "$*" >&2; exit 1; }
+
+usage() {
+	sed -n '3,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+	say ""
+	dim "flags: --cfg PATH  --dry-run  --yes  --backups N  --version"
+}
+
+# ---------------------------------------------------------------- helpers
+
+fmt_epoch() { date -r "$1" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '%s' "$1"; }
+
+is_mounted() { mountpoint -q "$1" 2>/dev/null; }
+
+cleanup() {
+	if [ -n "$MNT" ] && is_mounted "$MNT"; then
+		sync
+		umount "$MNT" 2>/dev/null && rmdir "$MNT" 2>/dev/null
+	fi
+}
+trap cleanup EXIT INT TERM
+
+# Entries, as GRUB numbers them: top-level menuentry and submenu share one
+# counter, and a child inside a submenu is written parent>child.
+parse_entries() {
+	local file=$1
+	awk '
+	function title_of(s) {
+		if (match(s, /"[^"]*"/)) return substr(s, RSTART + 1, RLENGTH - 2)
+		return "?"
+	}
+	BEGIN { depth = 0; top = -1; sidx = -1 }
+	{
+		line = $0
+		gsub(/"[^"]*"/, "\"\"", line)
+
+		if (depth == 0 && line ~ /^[ \t]*(menuentry|submenu)[ \t]/) {
+			top++
+			kind = (line ~ /^[ \t]*submenu/) ? "submenu" : "entry"
+			if (kind == "submenu") sidx = -1
+			printf "%d\t%s\t%s\n", top, title_of($0), kind
+		} else if (depth == 1 && top >= 0 && line ~ /^[ \t]*menuentry[ \t]/) {
+			sidx++
+			printf "%d>%d\t%s\tsubentry\n", top, sidx, title_of($0)
+		}
+
+		depth += gsub(/\{/, "{", line) - gsub(/\}/, "}", line)
+		if (depth < 0) depth = 0
+	}
+	' "$file"
+}
+
+current_default() {
+	sed -n 's/^[[:space:]]*set[[:space:]]\+default=\([^[:space:]]*\).*/\1/p' "$1" | head -1
+}
+
+current_timeout() {
+	sed -n 's/^[[:space:]]*set[[:space:]]\+timeout=\([^[:space:]]*\).*/\1/p' "$1" | head -1
+}
+
+entry_title() {
+	parse_entries "$1" | awk -F'\t' -v id="$2" '$1 == id { print $2; exit }'
+}
+
+# ---------------------------------------------------------------- ESP
+
+discover_cfgs() {
+	local out=() mp f
+
+	if [ -n "$CFG_OVERRIDE" ]; then
+		[ -f "$CFG_OVERRIDE" ] && printf '%s\n' "$CFG_OVERRIDE"
+		return 0
+	fi
+
+	for mp in /boot/efi /efi /boot; do
+		is_mounted "$mp" || continue
+		for f in "$mp"/EFI/*/grub.cfg "$mp"/grub/grub.cfg; do
+			[ -f "$f" ] && out+=("$f")
+		done
+	done
+
+	if [ ${#out[@]} -gt 0 ]; then
+		printf '%s\n' "${out[@]}" | awk '!seen[$0]++'
+		return 0
+	fi
+
+	# nothing mounted: look for a FAT partition that carries a grub.cfg
+	local dev tmp
+	while read -r dev; do
+		[ -n "$dev" ] || continue
+		[ "$(blkid -o value -s TYPE "$dev" 2>/dev/null)" = "vfat" ] || continue
+		tmp=$(mktemp -d) || continue
+		if mount -o ro "$dev" "$tmp" 2>/dev/null; then
+			if compgen -G "$tmp/EFI/*/grub.cfg" >/dev/null || [ -f "$tmp/grub/grub.cfg" ]; then
+				for f in "$tmp"/EFI/*/grub.cfg "$tmp"/grub/grub.cfg; do
+					[ -f "$f" ] && out+=("$dev:$f")
+				done
+			fi
+			umount "$tmp" 2>/dev/null
+		fi
+		rmdir "$tmp" 2>/dev/null
+	done < <(lsblk -rno NAME,TYPE | awk '$2 == "part" { print "/dev/" $1 }')
+
+	[ ${#out[@]} -gt 0 ] && printf '%s\n' "${out[@]}"
+	return 0
+}
+
+# Resolve CFG, mounting the ESP read-write only when we are about to write.
+resolve_cfg() {
+	local want_write=$1 found dev path rel
+
+	[ -n "$CFG" ] && [ -f "$CFG" ] && return 0
+
+	if [ -n "$CFG_OVERRIDE" ]; then
+		[ -f "$CFG_OVERRIDE" ] || die "no such file: $CFG_OVERRIDE"
+		CFG=$CFG_OVERRIDE
+		if [ "$want_write" = "1" ] && [ ! -w "$CFG" ]; then
+			die "$CFG is not writable (run as root)"
+		fi
+		return 0
+	fi
+
+	found=$(discover_cfgs)
+	[ -n "$found" ] || die "no grub.cfg found. Mount your ESP, or pass --cfg PATH"
+
+	if [ "$(printf '%s\n' "$found" | wc -l)" -gt 1 ]; then
+		warn "more than one grub.cfg, pick one with --cfg:"
+		printf '%s\n' "$found" | sed 's/^/    /'
+		exit 2
+	fi
+
+	if [ "${found#*:}" != "$found" ]; then
+		dev=${found%%:*}
+		path=${found#*:}
+
+		# map the probe path onto a fresh mountpoint
+		case "$path" in
+			*/EFI/*) rel=/EFI/${path#*/EFI/} ;;
+			*/grub/*) rel=/grub/${path#*/grub/} ;;
+			*) die "cannot work out the path of $path inside the ESP" ;;
+		esac
+
+		MNT=$(mktemp -d)
+		if [ "$want_write" = "1" ]; then
+			mount -o rw "$dev" "$MNT" || die "cannot mount $dev read-write"
+		else
+			mount -o ro "$dev" "$MNT" || die "cannot mount $dev"
+		fi
+		DEV=$dev
+		CFG="$MNT$rel"
+	else
+		CFG=$found
+		if [ "$want_write" = "1" ] && [ ! -w "$CFG" ]; then
+			die "$CFG is not writable. Remount its filesystem read-write, or run as root."
+		fi
+	fi
+
+	[ -f "$CFG" ] || die "resolved $CFG but it does not exist"
+}
+
+# ---------------------------------------------------------------- write
+
+backup_file() {
+	local src=$1 stamp dst n=1
+	stamp=$(date +%Y%m%d-%H%M%S)
+	dst="$src.bak-$stamp"
+	while [ -e "$dst" ]; do
+		dst="$src.bak-$stamp-$n"
+		n=$((n + 1))
+	done
+	cp -a "$src" "$dst" || die "cannot write a backup next to $src"
+	printf '%s\n' "$dst"
+
+	# keep the newest N
+	ls -1t "$src".bak-* 2>/dev/null | tail -n +$((KEEP_BACKUPS + 1)) |
+		while read -r old; do rm -f "$old"; done
+	return 0
+}
+
+validate() {
+	local file=$1 id=$2
+
+	if command -v grub-script-check >/dev/null 2>&1; then
+		grub-script-check "$file" || return 1
+	elif command -v grub2-script-check >/dev/null 2>&1; then
+		grub2-script-check "$file" || return 1
+	fi
+
+	if [ -n "$id" ]; then
+		[ -n "$(entry_title "$file" "$id")" ] || {
+			warn "entry $id does not exist in the written file"
+			return 1
+		}
+	fi
+	return 0
+}
+
+# Replace the default line atomically, or insert one before the first entry.
+write_default() {
+	local id=$1 file=$2 tmp
+	tmp=$(mktemp "$(dirname "$file")/.bootpick.XXXXXX") || die "ESP is full or read-only"
+
+	if grep -qE '^[[:space:]]*set[[:space:]]+default=' "$file"; then
+		sed "s|^[[:space:]]*set[[:space:]]\+default=.*|set default=$id|" "$file" >"$tmp"
+	else
+		awk -v id="$id" '
+			!done && /^[[:space:]]*(menuentry|submenu)[[:space:]]/ {
+				print "set default=" id
+				done = 1
+			}
+			{ print }
+		' "$file" >"$tmp"
+	fi
+
+	chmod --reference="$file" "$tmp" 2>/dev/null || chmod 644 "$tmp"
+	mv -f "$tmp" "$file" || die "could not replace $file"
+}
+
+write_timeout() {
+	local secs=$1 file=$2 tmp
+	tmp=$(mktemp "$(dirname "$file")/.bootpick.XXXXXX") || die "could not create a temp file"
+
+	if grep -qE '^[[:space:]]*set[[:space:]]+timeout=' "$file"; then
+		sed "s|^[[:space:]]*set[[:space:]]\+timeout=.*|set timeout=$secs|" "$file" >"$tmp"
+	else
+		awk -v t="$secs" '
+			!done && /^[[:space:]]*(menuentry|submenu)[[:space:]]/ {
+				print "set timeout=" t
+				done = 1
+			}
+			{ print }
+		' "$file" >"$tmp"
+	fi
+
+	chmod --reference="$file" "$tmp" 2>/dev/null || chmod 644 "$tmp"
+	mv -f "$tmp" "$file" || die "could not replace $file"
+}
+
+# ---------------------------------------------------------------- ui
+
+print_list() {
+	local file=$1 cur; cur=$(current_default "$file")
+	say ""
+	printf '  %-6s %-42s %s\n' "ID" "ENTRY" "KIND"
+	printf '  %-6s %-42s %s\n' "--" "-----" "----"
+	parse_entries "$file" | while IFS=$'\t' read -r id title kind; do
+		local mark="  "
+		[ "$id" = "$cur" ] && mark="${C_OK}●${C_OFF} "
+		printf '  %s%-5s %-42s %s%s%s\n' "$mark" "$id" "${title:0:42}" "$C_DIM" "$kind" "$C_OFF"
+	done
+	say ""
+	dim "  ● = boots by default    timeout: ${2:-?}s"
+	say ""
+}
+
+resolve_id() {
+	local file=$1 want=$2
+
+	if printf '%s' "$want" | grep -qE '^[0-9]+(>[0-9]+)?$'; then
+		printf '%s' "$want"
+		return 0
+	fi
+
+	local hit
+	hit=$(parse_entries "$file" | awk -F'\t' -v w="$want" '
+		tolower($2) == tolower(w) { print $1; found = 1; exit }
+		END { if (!found) exit 1 }')
+
+	if [ -z "$hit" ]; then
+		hit=$(parse_entries "$file" | awk -F'\t' -v w="$want" '
+			index(tolower($2), tolower(w)) { print $1 }
+		' | head -1)
+	fi
+
+	[ -n "$hit" ] || return 1
+	printf '%s' "$hit"
+}
+
+# ---------------------------------------------------------------- commands
+
+cmd_list() {
+	resolve_cfg 0
+	print_list "$CFG" "$(current_timeout "$CFG")"
+}
+
+cmd_show() {
+	resolve_cfg 0
+	local cur tmo title
+	cur=$(current_default "$CFG"); tmo=$(current_timeout "$CFG")
+	title=$(entry_title "$CFG" "$cur")
+	note "config:  $CFG"
+	note "default: ${cur:-<unset>}  ${title:+($title)}"
+	note "timeout: ${tmo:-<unset>}s"
+}
+
+cmd_set() {
+	local want=${1:-} cur id
+	[ -n "$want" ] || die "usage: $PROG set <id|name>"
+
+	resolve_cfg 1
+	id=$(resolve_id "$CFG" "$want") || die "no entry matches '$want'. Try: $PROG list"
+
+	cur=$(current_default "$CFG")
+	local title; title=$(entry_title "$CFG" "$id")
+	[ -n "$title" ] || die "entry '$id' does not exist. Try: $PROG list"
+
+	if [ "$cur" = "$id" ]; then
+		ok "already default: $id ($title)"
+		return 0
+	fi
+
+	if [ "$DRY_RUN" = "1" ]; then
+		note "would set default=$id ($title), was ${cur:-<unset>}"
+		return 0
+	fi
+
+	local bak; bak=$(backup_file "$CFG")
+	write_default "$id" "$CFG"
+
+	if ! validate "$CFG" "$id"; then
+		cp -a "$bak" "$CFG"
+		die "the edited config did not validate. Restored $bak"
+	fi
+
+	ok "default is now $id ($title)"
+	dim "  backup: $bak"
+}
+
+cmd_timeout() {
+	local want=${1:-}
+	[ -n "$want" ] || die "usage: $PROG timeout <seconds>"
+	printf '%s' "$want" | grep -qE '^[0-9]+$' || die "seconds must be a number"
+
+	resolve_cfg 1
+	local cur; cur=$(current_timeout "$CFG")
+
+	if [ "$DRY_RUN" = "1" ]; then
+		note "would set timeout=$want, was ${cur:-<unset>}"
+		return 0
+	fi
+
+	local bak; bak=$(backup_file "$CFG")
+	write_timeout "$want" "$CFG"
+	if ! validate "$CFG" ""; then
+		cp -a "$bak" "$CFG"
+		die "the edited config did not validate. Restored $bak"
+	fi
+	ok "menu countdown is now ${want}s"
+}
+
+cmd_backups() {
+	resolve_cfg 0
+	say ""
+	local found=0 f
+	for f in $(ls -1t "$CFG".bak-* 2>/dev/null); do
+		found=1
+		printf '  %-40s %s\n' "${f##*/}" "$(fmt_epoch "$f")"
+	done
+	[ "$found" = "1" ] || dim "  no backups next to $CFG"
+	say ""
+}
+
+cmd_restore() {
+	resolve_cfg 1
+	local want=${1:-}
+	local src
+
+	if [ -n "$want" ]; then
+		src=$want
+		[ -f "$src" ] || src="$CFG.bak-$want"
+	else
+		src=$(ls -1t "$CFG".bak-* 2>/dev/null | head -1)
+	fi
+
+	[ -n "$src" ] && [ -f "$src" ] || die "no backup to restore"
+	validate "$src" "" || die "$src does not parse; refusing to install it"
+
+	if [ "$DRY_RUN" = "1" ]; then
+		note "would restore $src over $CFG"
+		return 0
+	fi
+
+	backup_file "$CFG" >/dev/null
+	cp -a "$src" "$CFG"
+	ok "restored ${src##*/}"
+}
+
+cmd_pick() {
+	resolve_cfg 1
+	print_list "$CFG" "$(current_timeout "$CFG")"
+
+	local want
+	printf '  boot by default: '
+	read -r want || exit 1
+	[ -n "$want" ] || { dim "  nothing chosen"; return 0; }
+
+	local id; id=$(resolve_id "$CFG" "$want") || die "no entry matches '$want'"
+	local title; title=$(entry_title "$CFG" "$id")
+
+	if [ "$ASSUME_YES" = "0" ]; then
+		printf '  make %s%s%s the default? [y/N] ' "$C_HI" "$title" "$C_OFF"
+		local ans; read -r ans || exit 1
+		case "$ans" in y|Y|yes|YES) ;; *) dim "  unchanged"; return 0 ;; esac
+	fi
+
+	cmd_set "$id"
+}
+
+# ---------------------------------------------------------------- main
+
+CMD="pick"
+ARGS=()
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--cfg)      CFG_OVERRIDE=${2:-}; shift 2 ;;
+		--dry-run)  DRY_RUN=1; shift ;;
+		--yes|-y)   ASSUME_YES=1; shift ;;
+		--backups)  KEEP_BACKUPS=${2:-5}; shift 2 ;;
+		--version)  printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
+		--help|-h)  usage; exit 0 ;;
+		list|show|set|timeout|backups|restore|pick) CMD=$1; shift ;;
+		*)          ARGS+=("$1"); shift ;;
+	esac
+done
+
+case "$CMD" in
+	list)    cmd_list ;;
+	show)    cmd_show ;;
+	set)     cmd_set "${ARGS[0]:-}" ;;
+	timeout) cmd_timeout "${ARGS[0]:-}" ;;
+	backups) cmd_backups ;;
+	restore) cmd_restore "${ARGS[0]:-}" ;;
+	pick)    cmd_pick ;;
+	*)       die "unknown command: $CMD" ;;
+esac

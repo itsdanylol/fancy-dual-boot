@@ -1,0 +1,66 @@
+# An example dual-boot grub.cfg, hand-written, for one ESP and two Linux roots.
+#
+# Paths assume the kernel and initramfs live inside the ESP-mounted partition.
+# Adjust UUIDs with: blkid -s UUID -o value /dev/<partition>
+#
+# Verify before you reboot:  grub-script-check /path/to/this/file
+
+set default=0
+set timeout=5
+set timeout_style=menu
+
+# ---------------------------------------------------------------- modules
+insmod all_video
+insmod gfxterm
+insmod gfxmenu
+insmod png
+insmod part_gpt
+insmod ext2
+insmod fat
+insmod chain
+insmod linux
+insmod search_fs_uuid
+
+set gfxpayload=keep
+
+# ---------------------------------------------------------------- theme
+# A theme is optional and never load-bearing: if the font is missing, GRUB
+# keeps the plain text menu and everything still boots.
+if loadfont $prefix/fonts/unicode.pf2; then
+	set gfxmode=auto
+	terminal_output gfxterm
+	if [ -f $prefix/theme/theme.txt ]; then
+		set theme=$prefix/theme/theme.txt
+		export theme
+	fi
+fi
+
+# ---------------------------------------------------------------- uuids
+set root_uuid=REPLACE-WITH-ROOT-PARTITION-UUID
+
+# ---------------------------------------------------------------- entries
+menuentry "First system" --class linux {
+	search --no-floppy --fs-uuid --set=root "$root_uuid"
+	linux /boot/vmlinuz-linux root=UUID=$root_uuid rw quiet
+	initrd /boot/initramfs-linux.img
+}
+
+menuentry "Second system" --class linux {
+	search --no-floppy --fs-uuid --set=root "$second_uuid"
+	linux /boot/vmlinuz-linux root=UUID=$second_uuid rw quiet
+	initrd /boot/initramfs-linux.img
+}
+
+# ---------------------------------------------------------------- recovery
+# Never reached by the timeout, because the default is 0 and this is below it.
+submenu "Advanced options" {
+	menuentry "First system (rescue shell)" --class linux {
+		search --no-floppy --fs-uuid --set=root "$root_uuid"
+		linux /boot/vmlinuz-linux root=UUID=$root_uuid rw systemd.unit=rescue.target
+		initrd /boot/initramfs-linux.img
+	}
+
+	menuentry "Firmware settings" {
+		fwsetup
+	}
+}
